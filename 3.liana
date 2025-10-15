@@ -80,3 +80,35 @@ sc.pl.umap(
     color='class_label_simplified',
    save='.tiff'
 )
+
+import liana as li
+import scanpy as sc
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+
+print("LIANA version:", li.__version__)
+
+
+ad = sc.read_h5ad("adata_updated.h5ad")
+ad.var_names_make_unique()
+ad = ad.copy()
+groupby = "class_label_simplified"  
+
+#  LIANA
+li.mt.rank_aggregate(
+    adata=ad,
+    groupby=groupby,
+    resource_name='mouseconsensus', 
+    expr_prop=0.1,
+    min_cells=5,
+    use_raw=False,                  
+    n_perms=1000,
+    verbose=True,
+    inplace=True
+
+assert 'liana_res' in ad.uns and not ad.uns['liana_res'].empty, ""
+res = ad.uns['liana_res'].copy()
+print(res.head())
+res.to_csv("liana_res.csv", index=False)
+
