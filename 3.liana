@@ -43,6 +43,13 @@ adata_updated = ad.concat([adata_nonvascular, adata_vascular], join="outer", axi
 adata_updated = adata_updated[adata.obs_names]  
 print(adata_updated.obs['class_label'].value_counts())
 
+sc.settings.set_figure_params(
+    dpi=80, 
+    dpi_save=300,  
+    format="tiff",  
+    facecolor="white",  
+    vector_friendly=False  
+)
 sc.pl.umap(adata_updated, color='class_label', save='.tiff')
 
 def simplify_class(label):
@@ -111,4 +118,101 @@ assert 'liana_res' in ad.uns and not ad.uns['liana_res'].empty, ""
 res = ad.uns['liana_res'].copy()
 print(res.head())
 res.to_csv("liana_res.csv", index=False)
+
+import numpy as np, pandas as pd
+from scipy.stats import wilcoxon, mannwhitneyu
+
+
+PERI_A = "Peri_Ntrk2+"
+PERI_B = "Peri_Ntrk2zero"
+STRENGTH = "lrscore"  
+EPS = 1e-9
+
+
+TARGETS = [
+    "Neuron_Glutamate","Neuron_GABA","Endothelial","Astrocyte",
+    "Microglia","OPC-Oligo","Neuron_Dopamine","Neuron_Serotonin"
+]
+
+
+def _pick_strength_col(df, primary=STRENGTH):
+    if primary in df.columns: return primary
+    for cand in ['lrscore','scaled_weight','expr_prod','lr_means','spec_weight','lr_logfc']:
+        if cand in df.columns: return cand
+    raise ValueError("no avilable LR。")
+
+def _prep_df(res, strength):
+    df = res.copy()
+    col = _pick_strength_col(df, strength)
+    df['strength'] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+    lig = 'ligand_complex' if 'ligand_complex' in df.columns else 'ligand'
+    rec = 'receptor_complex' if 'receptor_complex' in df.columns else 'receptor'
+    df['LR'] = df[lig].astype(str) + "→" + df[rec].astype(str)
+    return df, col
+
+# ===== Peri→TARGET（=====
+def peri_to_target(df, target, eps=EPS):
+    A = df[(df['source']==PERI_A) & (df['target']==target)].groupby('LR')['strength'].mean().rename('A')
+    B = df[(df['source']==PERI_B) & (df['target']==target)].groupby('LR')['strength'].mean().rename('B')
+    pair = pd.concat([A,B], axis=1).dropna().reset_index()
+    if pair.empty:
+        return pair.assign(delta=np.nan, log2FC=np.nan), dict(target=target, n_pairs=0, median_log2FC=np.nan, pval=np.nan, test="NA", direction="Peri→TARGET")
+    pair['delta']  = pair['A'] - pair['B']
+    pair['log2FC'] = np.log2((pair['A']+eps)/(pair['B']+eps))
+  
+    try:
+        _, p = wilcoxon(pair['log2FC'].values, zero_method='wilcox'); test='Wilcoxon'
+    except ValueError:
+        p = mannwhitneyu(pair['A'].values, pair['B'].values, alternative='two-sided')[1]; test='Mann–Whitney'
+    eff = float(np.median(pair['log2FC']))
+    return pair, dict(target=target, n_pairs=len(pair), median_log2FC=eff, pval=p, test=test, direction="Peri→TARGET")
+
+# ===== TARGET→Peri=====
+def target_to_peri(df, target, eps=EPS):
+    A = df[(df['source']==target) & (df['target']==PERI_A)].groupby('LR')['strength'].mean().rename('A')
+    B = df[(df['source']==target) & (df['target']==PERI_B)].groupby('LR')['strength'].mean().rename('B')
+    pair = pd.concat([A,B], axis=1).dropna().reset_index()
+    if pair.empty:
+        return pair.assign(delta=np.nan, log2FC=np.nan), dict(target=target, n_pairs=0, median_log2FC=np.nan, pval=np.nan, test="NA", direction="TARGET→Peri")
+    pair['delta']  = pair['A'] - pair['B']
+    pair['log2FC'] = np.log2((pair['A']+eps)/(pair['B']+eps))
+    try:
+        _, p = wilcoxon(pair['log2FC'].values, zero_method='wilcox'); test='Wilcoxon'
+    except ValueError:
+        p = mannwhitneyu(pair['A'].values, pair['B'].values, alternative='two-sided')[1]; test='Mann–Whitney'
+    eff = float(np.median(pair['log2FC']))
+    return pair, dict(target=target, n_pairs=len(pair), median_log2FC=eff, pval=p, test=test, direction="TARGET→Peri")
+
+# ===== results =====
+def run_all_targets(res, targets=TARGETS, strength=STRENGTH, out_prefix="Peri_Target"):
+    df, col_used = _prep_df(res, strength)
+    print(f"Using strength column: {col_used}")
+    rows_out, rows_in = [], []
+    for t in targets:
+        # Peri → t
+        pair_out, sum_out = peri_to_target(df, t)
+        pair_out.to_csv(f"{out_prefix}_pairs_Peri_to_{t}.csv", index=False)
+        rows_out.append(sum_out)
+        # t → Peri
+        pair_in , sum_in  = target_to_peri(df, t)
+        pair_in.to_csv(f"{out_prefix}_pairs_{t}_to_Peri.csv", index=False)
+        rows_in.append(sum_in)
+        print(f"{t:>16s} | Peri→{t}: n={sum_out['n_pairs']}, median log2FC={sum_out['median_log2FC']:.4g}, P={sum_out['pval']:.2e} | {t}→Peri: n={sum_in['n_pairs']}, median log2FC={sum_in['median_log2FC']:.4g}, P={sum_in['pval']:.2e}")
+    summary_out = pd.DataFrame(rows_out)
+    summary_in  = pd.DataFrame(rows_in)
+    summary_out['strength_metric'] = col_used
+    summary_in ['strength_metric'] = col_used
+    summary_out.to_csv(f"{out_prefix}_SUMMARY_Peri_to_TARGET.csv", index=False)
+    summary_in .to_csv(f"{out_prefix}_SUMMARY_TARGET_to_Peri.csv", index=False)
+    return summary_out, summary_in
+
+
+res = ad.uns['liana_res'].copy()
+summary_out, summary_in = run_all_targets(res, targets=TARGETS, strength=STRENGTH)
+
+
+print("\nPeri→TARGET summary:")
+print(summary_out.sort_values('median_log2FC', ascending=False).head(10))
+print("\nTARGET→Peri summary:")
+print(summary_in.sort_values('median_log2FC', ascending=False).head(10))
 
