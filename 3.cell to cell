@@ -1,25 +1,19 @@
 mport numpy as np
 import pandas as pd
 
-# === 参数 ===
-CLASS_COL = "class_label"   # 大类列名
-VASC_KEYWORDS = ("vasc",)   # 识别血管类关键字（不区分大小写），比如 "Vascular"
-CAP_EACH_CLASS = 10000      # 非血管类每个 class 的最大保留细胞数（按需调）
+CLASS_COL = "class_label"   
+VASC_KEYWORDS = ("vasc",)   
+CAP_EACH_CLASS = 10000     
 SEED = 1
 
-# === 识别血管类 ===
 classes = adata.obs[CLASS_COL].astype(str)
 is_vasc = classes.str.lower().str.contains("|".join(VASC_KEYWORDS))
-print("识别到的血管类大类：", classes[is_vasc].unique())
+print("recgonized vascluture：", classes[is_vasc].unique())
 
-# === 生成需保留的索引：血管类全部保留；非血管类各类限量抽样 ===
 rs = np.random.RandomState(SEED)
 keep_idx = []
-
-# 1) 血管类（包含 Peri/Endo 等）全部保留 —— Peri 自然不会被下采
 keep_idx.extend(adata.obs_names[is_vasc])
 
-# 2) 非血管类：按 class_label 分组，每类最多 CAP_EACH_CLASS
 for cls, idx in adata.obs[~is_vasc].groupby(CLASS_COL).groups.items():
     idx = np.array(list(idx))
     take = min(CAP_EACH_CLASS, len(idx))
@@ -28,14 +22,61 @@ for cls, idx in adata.obs[~is_vasc].groupby(CLASS_COL).groups.items():
 
 keep_idx = np.array(keep_idx, dtype=object)
 
-# === 生成下采后的对象 ===
+
 adata_ds = adata[keep_idx, :].copy()
 
-print(f"原始细胞数: {adata.n_obs:,}")
-print(f"下采后细胞数: {adata_ds.n_obs:,}")
+print(f"orginal cell number: {adata.n_obs:,}")
+print(f"cell number after downsampling: {adata_ds.n_obs:,}")
 
-# 查看各大类采样前后对比
+
 before = adata.obs[CLASS_COL].value_counts().rename("before")
 after  = adata_ds.obs[CLASS_COL].value_counts().rename("after")
 comp = pd.concat([before, after], axis=1).fillna(0).astype(int).sort_index()
 print(comp)
+
+adata_nonvascular = adata[adata.obs['class_label'] != 'Vascular'].copy()
+
+# combine adata_vascular and non-vascular
+import anndata as ad
+
+adata_updated = ad.concat([adata_nonvascular, adata_vascular], join="outer", axis=0)
+adata_updated = adata_updated[adata.obs_names]  
+print(adata_updated.obs['class_label'].value_counts())
+
+sc.pl.umap(adata_updated, color='class_label', save='.tiff')
+
+def simplify_class(label):
+    label = str(label)
+    if 'Endo' in label:
+        return 'Endothelial'
+    elif 'Ntrk2High' in label:
+        return 'Peri_Ntrk2+'
+    elif 'Ntrk2Zero' in label:
+        return 'Peri_Ntrk2zero'
+    elif 'SMC' in label:
+        return 'SMC'
+    elif 'VLMC' in label:
+        return 'VLMC'
+    elif 'OPC' in label or 'Oligo' in label:
+        return 'OPC-Oligo'
+    elif 'Astro' in label or 'Epen' in label:
+        return 'Astrocyte'
+    elif 'Immune' in label:
+        return 'Microglia'
+    elif 'GABA' in label:
+        return 'Neuron_GABA'
+    elif 'Glut' in label:
+        return 'Neuron_Glutamate'
+    elif 'Dopa' in label:
+        return 'Neuron_Dopamine'
+    elif 'Sero' in label:
+        return 'Neuron_Serotonin'
+    else:
+        return 'Other'
+adata_updated.obs['class_label_simplified'] = adata_updated.obs['class_label'].apply(simplify_class)
+
+sc.pl.umap(
+    adata_updated,
+    color='class_label_simplified',
+   save='.tiff'
+)
