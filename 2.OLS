@@ -1,0 +1,71 @@
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from statsmodels.stats.multitest import multipletests
+from scipy.stats import norm
+
+
+X = peri_cleaned.X
+if hasattr(X, "A"):        
+    X = X.A
+elif sparse.issparse(X):
+    X = X.toarray()
+else:
+    X = np.asarray(X)
+
+Y = X.astype(np.float32)                 # (n_cells, n_genes)
+genes = np.array(peri_cleaned.var_names)
+
+# only keep express >=1% gene cell
+expr_rate = (Y > 0).mean(axis=0)
+keep = expr_rate >= 0.01
+Y = Y[:, keep]
+genes = genes[keep]
+expr_rate = expr_rate[keep]
+print(f"Kept {Y.shape[1]} genes (>=1% expressed).")
+
+# ===== B.Construct the design matrix: intercept + NTRK2_bin + sex + age_cat =====
+obs = peri_cleaned.obs.copy()
+obs['NTRK2_bin'] = (obs['clean_group'] == 'NTRK2_high_clean').astype(int)
+Xdesign_df = pd.get_dummies(
+    obs[['NTRK2_bin','sex','age_cat']], drop_first=True
+)
+Xdesign_df.insert(0, 'Intercept', 1.0)
+Xdesign = Xdesign_df.values.astype(np.float64)   # (n_cells, p)
+colnames = Xdesign_df.columns.to_list()
+print("Design matrix columns:", colnames)
+
+# ===== C. OLS：Batch fitting of all genes =====
+n, p = Xdesign.shape
+XtX = Xdesign.T @ Xdesign
+XtX_inv = np.linalg.pinv(XtX)              
+XtY = Xdesign.T @ Y
+B = XtX_inv @ XtY                          
+
+#Residuals and MSE
+Y_hat = Xdesign @ B
+E = Y - Y_hat
+sse = (E**2).sum(axis=0)
+mse = sse / max(n - p, 1)
+
+# results
+results = {"gene": genes, "expr_rate": expr_rate}
+for j, cname in enumerate(colnames):
+    beta = B[j, :]
+    se = np.sqrt(mse * XtX_inv[j, j])
+    z = beta / (se + 1e-12)
+    pvals = 2 * (1 - norm.cdf(np.abs(z)))
+    qvals = multipletests(pvals, method="fdr_bh")[1]
+
+    results[f"beta_{cname}"] = beta
+    results[f"se_{cname}"] = se
+    results[f"z_{cname}"] = z
+    results[f"pval_{cname}"] = pvals
+    results[f"qval_{cname}"] = qvals
+
+de_df = pd.DataFrame(results).sort_values("qval_NTRK2_bin", ascending=True)
+
+de_df.to_csv("Supplymentry7.tableDEG_NTRK2_sex_age_full_OLS.csv", index=False)
+print("✅ save：DEG_NTRK2_sex_age_full_OLS.csv")
+
+de_df.head(10)
