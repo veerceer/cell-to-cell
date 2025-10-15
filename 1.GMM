@@ -1,0 +1,141 @@
+import scanpy as sc
+import pandas as pd
+import numpy as np
+import diffxpy.api as de
+import scanpy as sc
+import pandas as pd
+import numpy as np
+import diffxpy.api as de
+
+
+
+vn = pd.Index(peri_clean.var_names)
+
+layer = "counts" if "counts" in peri_clean.layers else None
+if layer is not None:
+    x = peri_clean.layers[layer][:, peri_clean.var_names == gene].toarray().flatten()
+else
+    x = peri_clean.X[:, peri_clean.var_names == gene].toarray().flatten()
+
+peri_clean.obs["NTRK2_group"] = np.where(x > 0, "NTRK2_high", "NTRK2_zero")
+
+counts =peri_clean.obs["NTRK2_group"].value_counts().rename_axis("group").reset_index(name="n_cells")
+counts.to_csv("peri_clean_NTRK2_counts.csv", index=False)
+print(counts)
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.mixture import GaussianMixture
+import numpy as np
+import scipy.sparse as sp
+
+expr = peri_clean[:, gene].X
+if sp.issparse(expr):
+    expr = expr.toarray().flatten()
+else:
+    expr = expr.flatten()
+
+print("\n[Analysis] ...")
+
+
+plt.figure(figsize=(6,4))
+sns.histplot(expr, bins=60, kde=True, color="#4A90E2")
+plt.title(f"{gene} expression in pericytes")
+plt.xlabel("log-normalized expression")
+plt.ylabel("Density")
+plt.tight_layout()
+plt.savefig("Ntrk2_expression_hist.png", dpi=300)
+plt.show()
+print("[Plot] ：Ntrk2_expression_hist.png")
+
+
+expr_nonzero = expr[expr > 0]
+if len(expr_nonzero) < 50:
+    print(f"[Warning]  ({len(expr_nonzero)} 个)，no suitable。")
+else:
+    expr_nonzero = expr_nonzero.reshape(-1, 1)
+    gmm = GaussianMixture(n_components=2, random_state=42)
+    gmm.fit(expr_nonzero)
+    weights = gmm.weights_
+    means = gmm.means_.flatten()
+    print(f"[GMM] result：weights = {weights.round(3)}, means = {means.round(3)}")
+
+   
+    x_range = np.linspace(expr_nonzero.min(), expr_nonzero.max(), 500).reshape(-1, 1)
+    logprob = gmm.score_samples(x_range)
+    pdf = np.exp(logprob)
+    resp = gmm.predict_proba(x_range)
+    pdf_individual = resp * pdf[:, np.newaxis]
+
+    plt.figure(figsize=(6,4))
+    plt.hist(expr_nonzero, bins=60, density=True, alpha=0.5, color='gray')
+    plt.plot(x_range, pdf_individual[:, 0], '--', color='r', label='Component 1')
+    plt.plot(x_range, pdf_individual[:, 1], '--', color='b', label='Component 2')
+    plt.plot(x_range, pdf, '-', color='black', label='Total fit')
+    plt.title("Ntrk2 bimodal Gaussian fit (Pericytes)")
+    plt.xlabel("Expression")
+    plt.ylabel("Density")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("Ntrk2_bimodal_fit.png", dpi=300)
+    plt.show()
+
+    
+    diff = abs(means[0] - means[1])
+    if diff > 0.3:
+        print(f"[Result]  (means deta = {diff:.2f}) ✅")
+        probs = gmm.predict_proba(expr_nonzero)
+        cluster_labels = gmm.predict(expr_nonzero)
+        cutoff = np.mean(means) 
+        peri_clean.obs["Ntrk2_bimodal_group"] = "Low"
+        peri_clean.obs.loc[expr > cutoff, "Ntrk2_bimodal_group"] = "High"
+        print("[Group]：peri_clean.obs['Ntrk2_bimodal_group']")
+    else:
+        print(f"[Result] no diff (means = {diff:.2f}) ❌")
+try:
+    import diptest
+    stat, pval = diptest.diptest(expr)
+    print(f"[Dip test] statistic = {stat:.3f}, p-value = {pval:.3e}")
+    if pval < 0.05:
+        print("→  ✅")
+    else:
+        print("→  ❌")
+
+peri_clean.write("peri_clean_with_Ntrk2_groups.h5ad")
+print("\n[Saved]  AnnData ：peri_clean_with_Ntrk2_groups.h5ad")
+
+
+if "Ntrk2_bimodal_group" in peri_clean.obs:
+    summary = peri_clean.obs["Ntrk2_bimodal_group"].value_counts(normalize=True) * 100
+    print("\subcluster (%):")
+    print(summary.round(2))
+  
+# only abstract expressionn >0，re-GMM
+expr_nz = expr_all[expr_all > 0]
+gmm_nz = GaussianMixture(n_components=2, covariance_type="full", random_state=42)
+gmm_nz.fit(expr_nz.reshape(-1,1))
+w2 = gmm_nz.weights_
+mu2 = gmm_nz.means_.flatten()
+sd2 = np.sqrt(np.array([gmm_nz.covariances_[k][0,0] for k in range(2)]))
+order2 = np.argsort(mu2)
+w2, mu2, sd2 = w2[order2], mu2[order2], sd2[order2]
+
+xs2 = np.linspace(expr_nz.min(), expr_nz.max(), 800)
+pdf1_2 = w2[0]*norm.pdf(xs2, mu2[0], sd2[0])
+pdf2_2 = w2[1]*norm.pdf(xs2, mu2[1], sd2[1])
+pdf_2 = pdf1_2 + pdf2_2
+
+plt.figure(figsize=(7,4.5))
+sns.histplot(expr_nz, bins=60, stat="density", color="lightgray")
+plt.plot(xs2, pdf1_2, "--", color="tab:blue", label=f"Component 1 (μ={mu2[0]:.2f})")
+plt.plot(xs2, pdf2_2, "--", color="tab:red", label=f"Component 2 (μ={mu2[1]:.2f})")
+plt.plot(xs2, pdf_2, "-", color="black", label="Total fit")
+plt.xlabel("log-normalized expression (Ntrk2) (non-zero cells)")
+plt.ylabel("Density")
+plt.title("Ntrk2 bimodal distribution among Ntrk2⁺ pericytes")
+plt.legend()
+plt.tight_layout()
+plt.savefig("Ntrk2_bimodal_nonzero.png", dpi=300)
+plt.show()
+
+  
