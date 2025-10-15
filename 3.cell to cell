@@ -1,0 +1,41 @@
+mport numpy as np
+import pandas as pd
+
+# === 参数 ===
+CLASS_COL = "class_label"   # 大类列名
+VASC_KEYWORDS = ("vasc",)   # 识别血管类关键字（不区分大小写），比如 "Vascular"
+CAP_EACH_CLASS = 10000      # 非血管类每个 class 的最大保留细胞数（按需调）
+SEED = 1
+
+# === 识别血管类 ===
+classes = adata.obs[CLASS_COL].astype(str)
+is_vasc = classes.str.lower().str.contains("|".join(VASC_KEYWORDS))
+print("识别到的血管类大类：", classes[is_vasc].unique())
+
+# === 生成需保留的索引：血管类全部保留；非血管类各类限量抽样 ===
+rs = np.random.RandomState(SEED)
+keep_idx = []
+
+# 1) 血管类（包含 Peri/Endo 等）全部保留 —— Peri 自然不会被下采
+keep_idx.extend(adata.obs_names[is_vasc])
+
+# 2) 非血管类：按 class_label 分组，每类最多 CAP_EACH_CLASS
+for cls, idx in adata.obs[~is_vasc].groupby(CLASS_COL).groups.items():
+    idx = np.array(list(idx))
+    take = min(CAP_EACH_CLASS, len(idx))
+    if take > 0:
+        keep_idx.extend(rs.choice(idx, size=take, replace=False))
+
+keep_idx = np.array(keep_idx, dtype=object)
+
+# === 生成下采后的对象 ===
+adata_ds = adata[keep_idx, :].copy()
+
+print(f"原始细胞数: {adata.n_obs:,}")
+print(f"下采后细胞数: {adata_ds.n_obs:,}")
+
+# 查看各大类采样前后对比
+before = adata.obs[CLASS_COL].value_counts().rename("before")
+after  = adata_ds.obs[CLASS_COL].value_counts().rename("after")
+comp = pd.concat([before, after], axis=1).fillna(0).astype(int).sort_index()
+print(comp)
