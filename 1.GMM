@@ -1,141 +1,185 @@
-import scanpy as sc
-import pandas as pd
+# Bimodality analysis for Ntrk2 in pericytes (clean & review-ready)
+# =========================
+from pathlib import Path
+import os, json
 import numpy as np
-import diffxpy.api as de
-import scanpy as sc
 import pandas as pd
-import numpy as np
-import diffxpy.api as de
-
-
-
-vn = pd.Index(peri_clean.var_names)
-
-layer = "counts" if "counts" in peri_clean.layers else None
-if layer is not None:
-    x = peri_clean.layers[layer][:, peri_clean.var_names == gene].toarray().flatten()
-else
-    x = peri_clean.X[:, peri_clean.var_names == gene].toarray().flatten()
-
-peri_clean.obs["NTRK2_group"] = np.where(x > 0, "NTRK2_high", "NTRK2_zero")
-
-counts =peri_clean.obs["NTRK2_group"].value_counts().rename_axis("group").reset_index(name="n_cells")
-counts.to_csv("peri_clean_NTRK2_counts.csv", index=False)
-print(counts)
-
-import seaborn as sns
 import matplotlib.pyplot as plt
-from sklearn.mixture import GaussianMixture
-import numpy as np
+import seaborn as sns
 import scipy.sparse as sp
+from sklearn.mixture import GaussianMixture
 
-expr = peri_clean[:, gene].X
-if sp.issparse(expr):
-    expr = expr.toarray().flatten()
-else:
-    expr = expr.flatten()
+# =、
+gene = "Ntrk2"          # 、
+adata = peri_clean      # 、 AnnData
+outdir = Path("ntrk2_bimodality")
+outdir.mkdir(parents=True, exist_ok=True)
 
-print("\n[Analysis] ...")
+RANDOM_STATE = 42
+BINS = 60
+GMM_KS = (1, 2, 3)      
+CUT_STRATEGY = "midpoint"  # 'midpoint' | 'bayes'（ midpoint）
+LABEL_COL = f"{gene}_bimodal_group"
 
+if gene not in adata.var_names:
+    raise ValueError(f"{gene} 不在 adata.var_names 中")
 
+X = adata[:, gene].X
+expr = X.toarray().ravel() if sp.issparse(X) else np.asarray(X).ravel()
+n = expr.size
+nz_mask = expr > 0
+expr_nz = expr[nz_mask]
+n_zero = int((~nz_mask).sum())
+p_zero = n_zero / n
+
+print(f"[INFO] {gene} expression loaded. n={n}, zeros={n_zero} ({p_zero:.1%})")
+
+# ========= 1)+ KDE =========
 plt.figure(figsize=(6,4))
-sns.histplot(expr, bins=60, kde=True, color="#4A90E2")
-plt.title(f"{gene} expression in pericytes")
+sns.histplot(expr, bins=BINS, kde=True, color="#4A90E2")
+plt.title(f"{gene} expression in pericytes (all cells)")
 plt.xlabel("log-normalized expression")
 plt.ylabel("Density")
 plt.tight_layout()
-plt.savefig("Ntrk2_expression_hist.png", dpi=300)
-plt.show()
-print("[Plot] ：Ntrk2_expression_hist.png")
+plt.savefig(outdir / f"{gene}_all_hist_kde.png", dpi=300)
+plt.savefig(outdir / f"{gene}_all_hist_kde.tiff", dpi=300)
+plt.close()
 
+# ========= 2) Dip test=========
+dip_results = {}
+def safe_diptest(vec):
+    try:
+        import diptest
+        stat, p = diptest.diptest(vec)
+        return float(stat), float(p), None
+    except ImportError:
+        return None, None, "diptest not installed"
+    except Exception as e:
+        return None, None, f"diptest error: {e}"
 
-expr_nonzero = expr[expr > 0]
-if len(expr_nonzero) < 50:
-    print(f"[Warning]  ({len(expr_nonzero)} 个)，no suitable。")
+stat_all, p_all, note_all = safe_diptest(expr)
+dip_results["all"] = {"dip": stat_all, "p": p_all, "note": note_all}
+if stat_all is not None:
+    print(f"[DIP] ALL: dip={stat_all:.3f}, p={p_all:.3e}" if p_all is not None else f"[DIP] ALL: dip={stat_all:.3f}")
+
+if expr_nz.size >= 20:
+    stat_nz, p_nz, note_nz = safe_diptest(expr_nz)
 else:
-    expr_nonzero = expr_nonzero.reshape(-1, 1)
-    gmm = GaussianMixture(n_components=2, random_state=42)
-    gmm.fit(expr_nonzero)
-    weights = gmm.weights_
-    means = gmm.means_.flatten()
-    print(f"[GMM] result：weights = {weights.round(3)}, means = {means.round(3)}")
+    stat_nz, p_nz, note_nz = None, None, "too few non-zero cells"
+dip_results["nonzero"] = {"dip": stat_nz, "p": p_nz, "note": note_nz}
+if stat_nz is not None:
+    print(f"[DIP] NONZERO: dip={stat_nz:.3f}, p={p_nz:.3e}" if p_nz is not None else f"[DIP] NONZERO: dip={stat_nz:.3f}")
+else:
+    print(f"[DIP] NONZERO: {note_nz}")
 
-   
-    x_range = np.linspace(expr_nonzero.min(), expr_nonzero.max(), 500).reshape(-1, 1)
-    logprob = gmm.score_samples(x_range)
-    pdf = np.exp(logprob)
-    resp = gmm.predict_proba(x_range)
-    pdf_individual = resp * pdf[:, np.newaxis]
+# ========= 3) nozero：GMM BIC 比较（K=1/2/3）=========
+bic_rows = []
+best = None
+if expr_nz.size >= 10:
+    Z = expr_nz.reshape(-1, 1)
+    for k in GMM_KS:
+        gm = GaussianMixture(n_components=k, random_state=RANDOM_STATE)
+        gm.fit(Z)
+        bic = float(gm.bic(Z))
+        bic_rows.append({"K": k, "BIC": bic})
+        if (best is None) or (bic < best["BIC"]):
+            best = {"K": k, "BIC": bic, "model": gm}
+    bic_df = pd.DataFrame(bic_rows).sort_values("K")
+    bic_df.to_csv(outdir / f"{gene}_nonzero_BIC.csv", index=False)
+    print("[BIC] non-zero comparison:")
+    print(bic_df)
+else:
+    bic_df = pd.DataFrame(columns=["K","BIC"])
+    
+
+# ========= 4) 非零：拟合 2-GMM 并可视化（若样本足够）=========
+means, weights, sep, cutoff = None, None, None, None
+if expr_nz.size >= 50:
+    gmm2 = GaussianMixture(n_components=2, random_state=RANDOM_STATE).fit(expr_nz.reshape(-1,1))
+    # 按均值排序，保证 [小峰, 大峰]
+    order = np.argsort(gmm2.means_.ravel())
+    means = gmm2.means_.ravel()[order]
+    weights = gmm2.weights_[order]
+    sep = float(abs(means[1] - means[0]))
+    print(f"[GMM-2] non-zero: means={np.round(means,3)}, weights={np.round(weights,3)}, |Δμ|={sep:.3f}")
+
+    # 拟合曲线图
+    x_line = np.linspace(expr_nz.min(), expr_nz.max(), 500).reshape(-1,1)
+    tot_pdf = np.exp(gmm2.score_samples(x_line))
+    resp = gmm2.predict_proba(x_line)[:, order]  # 也排序对齐
+    comp_pdf = resp * tot_pdf[:, None]
 
     plt.figure(figsize=(6,4))
-    plt.hist(expr_nonzero, bins=60, density=True, alpha=0.5, color='gray')
-    plt.plot(x_range, pdf_individual[:, 0], '--', color='r', label='Component 1')
-    plt.plot(x_range, pdf_individual[:, 1], '--', color='b', label='Component 2')
-    plt.plot(x_range, pdf, '-', color='black', label='Total fit')
-    plt.title("Ntrk2 bimodal Gaussian fit (Pericytes)")
+    plt.hist(expr_nz, bins=BINS, density=True, alpha=0.5, color='gray', label="non-zero hist")
+    plt.plot(x_line, comp_pdf[:,0], '--', label='Component 1')
+    plt.plot(x_line, comp_pdf[:,1], '--', label='Component 2')
+    plt.plot(x_line, tot_pdf, '-', color='black', lw=1.5, label='Total fit')
+    plt.title(f"{gene} non-zero: 2-GMM fit")
     plt.xlabel("Expression")
     plt.ylabel("Density")
     plt.legend()
     plt.tight_layout()
-    plt.savefig("Ntrk2_bimodal_fit.png", dpi=300)
-    plt.show()
+    plt.savefig(outdir / f"{gene}_nonzero_gmm2_fit.png", dpi=300)
+    plt.savefig(outdir / f"{gene}_nonzero_gmm2_fit.tiff", dpi=300)
+    plt.close()
 
-    
-    diff = abs(means[0] - means[1])
-    if diff > 0.3:
-        print(f"[Result]  (means deta = {diff:.2f}) ✅")
-        probs = gmm.predict_proba(expr_nonzero)
-        cluster_labels = gmm.predict(expr_nonzero)
-        cutoff = np.mean(means) 
-        peri_clean.obs["Ntrk2_bimodal_group"] = "Low"
-        peri_clean.obs.loc[expr > cutoff, "Ntrk2_bimodal_group"] = "High"
-        print("[Group]：peri_clean.obs['Ntrk2_bimodal_group']")
-    else:
-        print(f"[Result] no diff (means = {diff:.2f}) ❌")
-try:
-    import diptest
-    stat, pval = diptest.diptest(expr)
-    print(f"[Dip test] statistic = {stat:.3f}, p-value = {pval:.3e}")
-    if pval < 0.05:
-        print("→  ✅")
-    else:
-        print("→  ❌")
+    # 操作性阈值（两均值中点；可替换为 Bayes 交点）
+    cutoff = float(np.mean(means))
+    print(f"[CUTOFF] operational cutoff = {cutoff:.4f} (midpoint)")
+else:
+    print("[GMM-2] 非零样本不足 50，跳过 2-GMM 可视化（如需可降低门槛）。")
 
-peri_clean.write("peri_clean_with_Ntrk2_groups.h5ad")
-print("\n[Saved]  AnnData ：peri_clean_with_Ntrk2_groups.h5ad")
+# ========= 5) 标注 High/Low 标签（默认在全体上切分）=========
+adata.obs[LABEL_COL] = "Low"
+if cutoff is not None:
+    adata.obs.loc[expr > cutoff, LABEL_COL] = "High"
 
+# 若只在“非零表达”细胞里切分，使用下面这一行替换上面两行：
+# adata.obs[LABEL_COL] = np.where(expr > 0, np.where(expr > cutoff, "High","Low"), "Low")
 
-if "Ntrk2_bimodal_group" in peri_clean.obs:
-    summary = peri_clean.obs["Ntrk2_bimodal_group"].value_counts(normalize=True) * 100
-    print("\subcluster (%):")
-    print(summary.round(2))
-  
-# only abstract expressionn >0，re-GMM
-expr_nz = expr_all[expr_all > 0]
-gmm_nz = GaussianMixture(n_components=2, covariance_type="full", random_state=42)
-gmm_nz.fit(expr_nz.reshape(-1,1))
-w2 = gmm_nz.weights_
-mu2 = gmm_nz.means_.flatten()
-sd2 = np.sqrt(np.array([gmm_nz.covariances_[k][0,0] for k in range(2)]))
-order2 = np.argsort(mu2)
-w2, mu2, sd2 = w2[order2], mu2[order2], sd2[order2]
+prop = adata.obs[LABEL_COL].value_counts(normalize=True).rename("proportion").mul(100).round(2)
+prop.to_csv(outdir / f"{gene}_group_proportions.csv", header=True)
+print("[GROUP] proportions (%):\n", prop)
 
-xs2 = np.linspace(expr_nz.min(), expr_nz.max(), 800)
-pdf1_2 = w2[0]*norm.pdf(xs2, mu2[0], sd2[0])
-pdf2_2 = w2[1]*norm.pdf(xs2, mu2[1], sd2[1])
-pdf_2 = pdf1_2 + pdf2_2
+# ========= 6) 摘要 JSON（便于写法&复现）=========
+summary = {
+    "n_total": int(n),
+    "zeros": n_zero,
+    "zero_fraction": float(p_zero),
+    "nonzero_n": int(expr_nz.size),
+    "dip_all": dip_results["all"],
+    "dip_nonzero": dip_results["nonzero"],
+    "bic_nonzero": bic_rows,
+    "bic_best_K": (None if best is None else int(best["K"])),
+    "gmm2_means_nonzero": (None if means is None else [float(means[0]), float(means[1])]),
+    "gmm2_weights_nonzero": (None if weights is None else [float(weights[0]), float(weights[1])]),
+    "gmm2_mean_gap": sep,
+    "cutoff_strategy": CUT_STRATEGY,
+    "cutoff_value": cutoff,
+    "label_column": LABEL_COL,
+    "proportions_percent": prop.to_dict()
+}
+with open(outdir / f"{gene}_zero_inflated_summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
 
-plt.figure(figsize=(7,4.5))
-sns.histplot(expr_nz, bins=60, stat="density", color="lightgray")
-plt.plot(xs2, pdf1_2, "--", color="tab:blue", label=f"Component 1 (μ={mu2[0]:.2f})")
-plt.plot(xs2, pdf2_2, "--", color="tab:red", label=f"Component 2 (μ={mu2[1]:.2f})")
-plt.plot(xs2, pdf_2, "-", color="black", label="Total fit")
-plt.xlabel("log-normalized expression (Ntrk2) (non-zero cells)")
-plt.ylabel("Density")
-plt.title("Ntrk2 bimodal distribution among Ntrk2⁺ pericytes")
-plt.legend()
-plt.tight_layout()
-plt.savefig("Ntrk2_bimodal_nonzero.png", dpi=300)
-plt.show()
+# ========= 7) 保存 AnnData =========
+saved_path = outdir / f"peri_with_{gene}_groups.h5ad"
+adata.write(saved_path)
+print(f"[SAVED] AnnData with '{LABEL_COL}' written to: {saved_path}")
+
+# ========= 8) 控制台一句话总结 =========
+def fmt_p(p):
+    if p is None: return "NA"
+    return f"{p:.2e}"
+
+print(
+    "\n[SUMMARY] "
+    f"{gene}: zeros={p_zero:.1%}; "
+    f"dip(all) p={fmt_p(dip_results['all']['p'])}; "
+    f"dip(non-zero) p={fmt_p(dip_results['nonzero']['p'])}; "
+    f"non-zero BIC best K={(None if best is None else int(best['K']))}; "
+    f"GMM-2 |Δμ|={( 'NA' if sep is None else f'{sep:.3f}' )}; "
+    f"High={prop.get('High',0):.2f}%, Low={prop.get('Low',0):.2f}%."
+)
 
   
