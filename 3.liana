@@ -216,3 +216,167 @@ print(summary_out.sort_values('median_log2FC', ascending=False).head(10))
 print("\nTARGET→Peri summary:")
 print(summary_in.sort_values('median_log2FC', ascending=False).head(10))
 
+PERI_A = "Peri_Ntrk2+"
+PERI_B = "Peri_Ntrk2zero"
+STRENGTH = "lrscore"  
+EPS = 1e-9
+
+
+TARGETS = [
+    "Neuron_Glutamate","Neuron_GABA","Endothelial","Astrocyte",
+    "Microglia","OPC-Oligo","Neuron_Dopamine","Neuron_Serotonin"
+]
+
+
+def _pick_strength_col(df, primary=STRENGTH):
+    if primary in df.columns: return primary
+    for cand in ['lrscore','scaled_weight','expr_prod','lr_means','spec_weight','lr_logfc']:
+        if cand in df.columns: return cand
+    raise ValueError("no aviable LR。")
+
+def _prep_df(res, strength):
+    df = res.copy()
+    col = _pick_strength_col(df, strength)
+    df['strength'] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+    lig = 'ligand_complex' if 'ligand_complex' in df.columns else 'ligand'
+    rec = 'receptor_complex' if 'receptor_complex' in df.columns else 'receptor'
+    df['LR'] = df[lig].astype(str) + "→" + df[rec].astype(str)
+    return df, col
+
+# ===== Peri→TARGET=====
+def peri_to_target(df, target, eps=EPS):
+    A = df[(df['source']==PERI_A) & (df['target']==target)].groupby('LR')['strength'].mean().rename('A')
+    B = df[(df['source']==PERI_B) & (df['target']==target)].groupby('LR')['strength'].mean().rename('B')
+    pair = pd.concat([A,B], axis=1).dropna().reset_index()
+    if pair.empty:
+        return pair.assign(delta=np.nan, log2FC=np.nan), dict(target=target, n_pairs=0, median_log2FC=np.nan, pval=np.nan, test="NA", direction="Peri→TARGET")
+    pair['delta']  = pair['A'] - pair['B']
+    pair['log2FC'] = np.log2((pair['A']+eps)/(pair['B']+eps))
+    
+    try:
+        _, p = wilcoxon(pair['log2FC'].values, zero_method='wilcox'); test='Wilcoxon'
+    except ValueError:
+        p = mannwhitneyu(pair['A'].values, pair['B'].values, alternative='two-sided')[1]; test='Mann–Whitney'
+    eff = float(np.median(pair['log2FC']))
+    return pair, dict(target=target, n_pairs=len(pair), median_log2FC=eff, pval=p, test=test, direction="Peri→TARGET")
+
+# ===== TARGET→Peri=====
+def target_to_peri(df, target, eps=EPS):
+    A = df[(df['source']==target) & (df['target']==PERI_A)].groupby('LR')['strength'].mean().rename('A')
+    B = df[(df['source']==target) & (df['target']==PERI_B)].groupby('LR')['strength'].mean().rename('B')
+    pair = pd.concat([A,B], axis=1).dropna().reset_index()
+    if pair.empty:
+        return pair.assign(delta=np.nan, log2FC=np.nan), dict(target=target, n_pairs=0, median_log2FC=np.nan, pval=np.nan, test="NA", direction="TARGET→Peri")
+    pair['delta']  = pair['A'] - pair['B']
+    pair['log2FC'] = np.log2((pair['A']+eps)/(pair['B']+eps))
+    try:
+        _, p = wilcoxon(pair['log2FC'].values, zero_method='wilcox'); test='Wilcoxon'
+    except ValueError:
+        p = mannwhitneyu(pair['A'].values, pair['B'].values, alternative='two-sided')[1]; test='Mann–Whitney'
+    eff = float(np.median(pair['log2FC']))
+    return pair, dict(target=target, n_pairs=len(pair), median_log2FC=eff, pval=p, test=test, direction="TARGET→Peri")
+
+# ===== Results=====
+def run_all_targets(res, targets=TARGETS, strength=STRENGTH, out_prefix="Peri_Target"):
+    df, col_used = _prep_df(res, strength)
+    print(f"Using strength column: {col_used}")
+    # 汇总列表
+    rows_out, rows_in = [], []
+    for t in targets:
+        # Peri → t
+        pair_out, sum_out = peri_to_target(df, t)
+        pair_out.to_csv(f"{out_prefix}_pairs_Peri_to_{t}.csv", index=False)
+        rows_out.append(sum_out)
+        # t → Peri
+        pair_in , sum_in  = target_to_peri(df, t)
+        pair_in.to_csv(f"{out_prefix}_pairs_{t}_to_Peri.csv", index=False)
+        rows_in.append(sum_in)
+        print(f"{t:>16s} | Peri→{t}: n={sum_out['n_pairs']}, median log2FC={sum_out['median_log2FC']:.4g}, P={sum_out['pval']:.2e} | {t}→Peri: n={sum_in['n_pairs']}, median log2FC={sum_in['median_log2FC']:.4g}, P={sum_in['pval']:.2e}")
+   
+    summary_out = pd.DataFrame(rows_out)
+    summary_in  = pd.DataFrame(rows_in)
+    summary_out['strength_metric'] = col_used
+    summary_in ['strength_metric'] = col_used
+    summary_out.to_csv(f"{out_prefix}_SUMMARY_Peri_to_TARGET.csv", index=False)
+    summary_in .to_csv(f"{out_prefix}_SUMMARY_TARGET_to_Peri.csv", index=False)
+    return summary_out, summary_in
+
+
+res = ad.uns['liana_res'].copy()
+summary_out, summary_in = run_all_targets(res, targets=TARGETS, strength=STRENGTH)
+
+#  BH adjust
+import pandas as pd
+from statsmodels.stats.multitest import multipletests
+
+
+so = pd.read_csv("Peri_Target_SUMMARY_Peri_to_TARGET.csv")      # Peri→TARGET
+si = pd.read_csv("Peri_Target_SUMMARY_TARGET_to_Peri.csv")      # TARGET→Peri
+
+both = pd.concat([so.assign(direction_label='Peri→TARGET'),
+                  si.assign(direction_label='TARGET→Peri')],
+                 ignore_index=True)
+
+both['FDR'] = multipletests(both['pval'].values, method='fdr_bh')[1]
+both = both.sort_values(['direction_label','FDR'])
+
+both.to_csv("Peri_Target_SUMMARY_withFDR.csv", index=False)
+print(both[['direction_label','target','n_pairs','median_log2FC','pval','FDR']])
+
+# Signed-Rank Test（every target）
+import numpy as np, pandas as pd
+from scipy.stats import binomtest
+
+TARGETS = ["Neuron_Glutamate","Neuron_GABA","Endothelial","Astrocyte",
+           "Microglia","OPC-Oligo","Neuron_Dopamine","Neuron_Serotonin"]
+
+rows = []
+for t in TARGETS:
+    # Peri→t
+    df = pd.read_csv(f"Peri_Target_pairs_Peri_to_{t}.csv")
+    if not df.empty:
+        d = df['log2FC'].to_numpy()
+        k, n = int((d>0).sum()), d.size
+        p = binomtest(k, n, 0.5, alternative='two-sided').pvalue
+        rows.append(dict(direction='Peri→'+t, target=t, n_pairs=n, frac_pos=k/n, sign_p=p))
+    # t→Peri
+    df = pd.read_csv(f"Peri_Target_pairs_{t}_to_Peri.csv")
+    if not df.empty:
+        d = df['log2FC'].to_numpy()
+        k, n = int((d>0).sum()), d.size
+        p = binomtest(k, n, 0.5, alternative='two-sided').pvalue
+        rows.append(dict(direction=t+'→Peri', target=t, n_pairs=n, frac_pos=k/n, sign_p=p))
+
+sign_df = pd.DataFrame(rows).sort_values('sign_p')
+sign_df.to_csv("Peri_Target_SIGN_TEST.csv", index=False)
+print(sign_df)
+
+# Empirical Permutation P-value
+import numpy as np, pandas as pd
+
+def perm_p_log2fc_from_pairs(pair_csv, n_perm=1000, seed=1):
+    df = pd.read_csv(pair_csv)
+    if df.empty: return np.nan, np.nan, 0
+    d_real = float(np.median(df['log2FC'].values))
+    rng = np.random.default_rng(seed)
+    null = []
+    A = df['A'].to_numpy(); B = df['B'].to_numpy()
+    m = len(df)
+    for _ in range(n_perm):
+        flip = rng.random(m) < 0.5
+        Aperm = np.where(flip, B, A)
+        Bperm = np.where(flip, A, B)
+        null.append(np.median(np.log2((Aperm+1e-9)/(Bperm+1e-9))))
+    emp_p = (np.sum(np.abs(null) >= abs(d_real)) + 1) / (n_perm + 1)
+    return d_real, emp_p, m
+
+rows = []
+for t in TARGETS:
+    real, p, n = perm_p_log2fc_from_pairs(f"Peri_Target_pairs_Peri_to_{t}.csv")
+    rows.append(dict(direction='Peri→'+t, target=t, n_pairs=n, median_log2FC=real, permP=p))
+    real, p, n = perm_p_log2fc_from_pairs(f"Peri_Target_pairs_{t}_to_Peri.csv")
+    rows.append(dict(direction=t+'→Peri', target=t, n_pairs=n, median_log2FC=real, permP=p))
+
+perm_df = pd.DataFrame(rows).sort_values('permP')
+perm_df.to_csv("Peri_Target_PERM_P.csv", index=False)
+print(perm_df)
