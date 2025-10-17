@@ -9,9 +9,8 @@ import seaborn as sns
 import scipy.sparse as sp
 from sklearn.mixture import GaussianMixture
 
-# =、
-gene = "Ntrk2"          # 、
-adata = peri_clean      # 、 AnnData
+gene = "Ntrk2"          # 
+adata = peri_clean      #  AnnData
 outdir = Path("ntrk2_bimodality")
 outdir.mkdir(parents=True, exist_ok=True)
 
@@ -22,7 +21,7 @@ CUT_STRATEGY = "midpoint"  # 'midpoint' | 'bayes'（ midpoint）
 LABEL_COL = f"{gene}_bimodal_group"
 
 if gene not in adata.var_names:
-    raise ValueError(f"{gene} 不在 adata.var_names 中")
+    raise ValueError(f"{gene} no in adata.var_names ")
 
 X = adata[:, gene].X
 expr = X.toarray().ravel() if sp.issparse(X) else np.asarray(X).ravel()
@@ -72,7 +71,7 @@ if stat_nz is not None:
 else:
     print(f"[DIP] NONZERO: {note_nz}")
 
-# ========= 3) nozero：GMM BIC 比较（K=1/2/3）=========
+# ========= 3) nozero：GMM BIC comprise（K=1/2/3）=========
 bic_rows = []
 best = None
 if expr_nz.size >= 10:
@@ -92,21 +91,21 @@ else:
     bic_df = pd.DataFrame(columns=["K","BIC"])
     
 
-# ========= 4) 非零：拟合 2-GMM 并可视化（若样本足够）=========
+# ========= 4) no-zero：Fit a 2-GMM and plot the results=========
 means, weights, sep, cutoff = None, None, None, None
 if expr_nz.size >= 50:
     gmm2 = GaussianMixture(n_components=2, random_state=RANDOM_STATE).fit(expr_nz.reshape(-1,1))
-    # 按均值排序，保证 [小峰, 大峰]
+    
     order = np.argsort(gmm2.means_.ravel())
     means = gmm2.means_.ravel()[order]
     weights = gmm2.weights_[order]
     sep = float(abs(means[1] - means[0]))
     print(f"[GMM-2] non-zero: means={np.round(means,3)}, weights={np.round(weights,3)}, |Δμ|={sep:.3f}")
 
-    # 拟合曲线图
+    
     x_line = np.linspace(expr_nz.min(), expr_nz.max(), 500).reshape(-1,1)
     tot_pdf = np.exp(gmm2.score_samples(x_line))
-    resp = gmm2.predict_proba(x_line)[:, order]  # 也排序对齐
+    resp = gmm2.predict_proba(x_line)[:, order]  
     comp_pdf = resp * tot_pdf[:, None]
 
     plt.figure(figsize=(6,4))
@@ -123,63 +122,21 @@ if expr_nz.size >= 50:
     plt.savefig(outdir / f"{gene}_nonzero_gmm2_fit.tiff", dpi=300)
     plt.close()
 
-    # 操作性阈值（两均值中点；可替换为 Bayes 交点）
+    
     cutoff = float(np.mean(means))
     print(f"[CUTOFF] operational cutoff = {cutoff:.4f} (midpoint)")
 else:
-    print("[GMM-2] 非零样本不足 50，跳过 2-GMM 可视化（如需可降低门槛）。")
+    print("[GMM-2] sample no up to 50， no 2-GMM 。")
 
-# ========= 5) 标注 High/Low 标签（默认在全体上切分）=========
+
 adata.obs[LABEL_COL] = "Low"
 if cutoff is not None:
     adata.obs.loc[expr > cutoff, LABEL_COL] = "High"
 
-# 若只在“非零表达”细胞里切分，使用下面这一行替换上面两行：
-# adata.obs[LABEL_COL] = np.where(expr > 0, np.where(expr > cutoff, "High","Low"), "Low")
+
 
 prop = adata.obs[LABEL_COL].value_counts(normalize=True).rename("proportion").mul(100).round(2)
 prop.to_csv(outdir / f"{gene}_group_proportions.csv", header=True)
 print("[GROUP] proportions (%):\n", prop)
-
-# ========= 6) 摘要 JSON（便于写法&复现）=========
-summary = {
-    "n_total": int(n),
-    "zeros": n_zero,
-    "zero_fraction": float(p_zero),
-    "nonzero_n": int(expr_nz.size),
-    "dip_all": dip_results["all"],
-    "dip_nonzero": dip_results["nonzero"],
-    "bic_nonzero": bic_rows,
-    "bic_best_K": (None if best is None else int(best["K"])),
-    "gmm2_means_nonzero": (None if means is None else [float(means[0]), float(means[1])]),
-    "gmm2_weights_nonzero": (None if weights is None else [float(weights[0]), float(weights[1])]),
-    "gmm2_mean_gap": sep,
-    "cutoff_strategy": CUT_STRATEGY,
-    "cutoff_value": cutoff,
-    "label_column": LABEL_COL,
-    "proportions_percent": prop.to_dict()
-}
-with open(outdir / f"{gene}_zero_inflated_summary.json", "w") as f:
-    json.dump(summary, f, indent=2)
-
-# ========= 7) 保存 AnnData =========
-saved_path = outdir / f"peri_with_{gene}_groups.h5ad"
-adata.write(saved_path)
-print(f"[SAVED] AnnData with '{LABEL_COL}' written to: {saved_path}")
-
-# ========= 8) 控制台一句话总结 =========
-def fmt_p(p):
-    if p is None: return "NA"
-    return f"{p:.2e}"
-
-print(
-    "\n[SUMMARY] "
-    f"{gene}: zeros={p_zero:.1%}; "
-    f"dip(all) p={fmt_p(dip_results['all']['p'])}; "
-    f"dip(non-zero) p={fmt_p(dip_results['nonzero']['p'])}; "
-    f"non-zero BIC best K={(None if best is None else int(best['K']))}; "
-    f"GMM-2 |Δμ|={( 'NA' if sep is None else f'{sep:.3f}' )}; "
-    f"High={prop.get('High',0):.2f}%, Low={prop.get('Low',0):.2f}%."
-)
 
   
